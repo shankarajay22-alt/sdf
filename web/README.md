@@ -41,6 +41,17 @@ tightest results (~0.02–0.05 mm) use the full Python pipeline in
 `../glass_bead_measurement/`, which keeps full resolution and supports ArUco
 calibration markers.
 
+## No hosting? Use the single-file build
+
+`standalone.html` is the whole app inlined into one file (OpenCV.js still loads
+from its CDN, so you need internet on first use). Share it to your phone
+(WhatsApp / Drive / email) and open it in Chrome — no server required. To
+regenerate it after editing `index.html` / `app.js`:
+
+```bash
+cd web && python3 -c "h=open('index.html').read();j=open('app.js').read();open('standalone.html','w').write(h.replace('<script src=\"app.js\"></script>','<script>'+j+'</script>'))"
+```
+
 ## Run locally
 
 It's just static files — open `index.html` in a browser, or serve the folder:
