@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="theme-color" content="#0f172a" />
+<title>Glass Bead Measurement</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel2: #273449;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #22c55e;
+    --accent2: #38bdf8; --danger: #ef4444; --warn: #eab308;
+    --border: #334155;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5; padding-bottom: 40px;
+  }
+  header {
+    padding: 16px; background: linear-gradient(135deg, #0f172a, #1e293b);
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { margin: 0; font-size: 1.15rem; display: flex; align-items: center; gap: 8px; }
+  header p { margin: 4px 0 0; font-size: 0.78rem; color: var(--muted); }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 14px; margin-top: 14px;
+  }
+  .card h2 { margin: 0 0 10px; font-size: 0.95rem; color: var(--accent2); }
+  label { display: block; font-size: 0.8rem; color: var(--muted); margin: 8px 0 4px; }
+  input[type=number], select {
+    width: 100%; padding: 11px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); font-size: 1rem;
+  }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  button {
+    width: 100%; padding: 14px; border: none; border-radius: 12px;
+    font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 10px;
+    background: var(--accent); color: #052e16;
+  }
+  button.secondary { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  button.accent2 { background: var(--accent2); color: #042f3a; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .filebtn {
+    display: block; text-align: center; padding: 16px; border-radius: 12px;
+    background: var(--accent2); color: #042f3a; font-weight: 700; cursor: pointer;
+  }
+  .filebtn input { display: none; }
+  canvas { width: 100%; border-radius: 12px; background: #000; display: block; touch-action: none; }
+  .hint { font-size: 0.78rem; color: var(--muted); margin-top: 6px; }
+  .pill { display: inline-block; font-size: 0.7rem; padding: 2px 8px; border-radius: 999px; background: var(--panel2); color: var(--muted); margin-right: 4px; }
+  .bead {
+    border: 1px solid var(--border); border-radius: 12px; padding: 10px;
+    margin-top: 10px; background: var(--panel2);
+  }
+  .bead h3 { margin: 0 0 8px; font-size: 0.9rem; }
+  .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .metric { background: var(--panel); border-radius: 8px; padding: 8px; text-align: center; }
+  .metric .v { font-size: 1.05rem; font-weight: 700; }
+  .metric .k { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; }
+  .ok { color: var(--accent); } .bad { color: var(--danger); } .warnc { color: var(--warn); }
+  .banner { padding: 12px; border-radius: 10px; margin-top: 12px; font-size: 0.88rem; }
+  .banner.err { background: #450a0a; color: #fecaca; border: 1px solid #7f1d1d; }
+  .banner.warn { background: #422006; color: #fde68a; border: 1px solid #854d0e; }
+  .banner.ok { background: #052e16; color: #bbf7d0; border: 1px solid #166534; }
+  #loading { text-align: center; padding: 30px; color: var(--muted); }
+  .spinner { border: 3px solid var(--border); border-top-color: var(--accent2);
+    border-radius: 50%; width: 28px; height: 28px; animation: spin 0.8s linear infinite; margin: 0 auto 10px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  ul.tips { margin: 6px 0 0; padding-left: 18px; font-size: 0.78rem; color: var(--muted); }
+  ul.tips li { margin: 2px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
+  th, td { border: 1px solid var(--border); padding: 6px; text-align: center; }
+  th { background: var(--panel2); }
+  .calib-status { font-size: 0.82rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>🔬 Glass Bead Measurement</h1>
+    <p>Measure outer / hole diameter from a photo — runs fully in your browser.</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div id="loading" class="card">
+    <div class="spinner"></div>
+    Loading vision engine (OpenCV)… first load can take ~10–20 s on mobile.
+  </div>
+
+  <div id="app" style="display:none;">
+
+    <div class="card">
+      <h2>1 · Photo</h2>
+      <label class="filebtn">
+        📷 Take / choose a photo
+        <input id="fileInput" type="file" accept="image/*" capture="environment" />
+      </label>
+      <details style="margin-top:10px;">
+        <summary class="hint">Capture tips for best accuracy</summary>
+        <ul class="tips">
+          <li>Top-down view, lens parallel to the beads (no tilt).</li>
+          <li>Plain white, matte background; even, soft lighting.</li>
+          <li>Avoid hard reflections/glare on the glass.</li>
+          <li>Keep a ruler or known-size reference in frame.</li>
+          <li>Get close — each bead should be large and sharp.</li>
+        </ul>
+      </details>
+    </div>
+
+    <div class="card" id="calibCard" style="display:none;">
+      <h2>2 · Calibration <span class="pill">required</span></h2>
+      <label>Reference method</label>
+      <select id="calibMethod">
+        <option value="twopoint">Tap two points a known distance apart (ruler)</option>
+        <option value="manual">Enter pixels-per-mm manually</option>
+        <option value="circle">Auto-detect a calibration circle</option>
+      </select>
+
+      <div id="twopointUI">
+        <p class="hint">Tap <b>two points</b> on the image that are a known distance
+          apart (e.g. two ruler marks). Then enter that distance below.</p>
+        <button class="secondary" id="resetTaps">Reset taps</button>
+        <label>Distance between the two points (mm)</label>
+        <input id="knownDist" type="number" value="10" step="0.1" min="0.1" />
+      </div>
+
+      <div id="manualUI" style="display:none;">
+        <label>Pixels per mm</label>
+        <input id="pxPerMm" type="number" value="50" step="0.1" min="0.1" />
+        <p class="hint">Use this if you already know the scale of the image.</p>
+      </div>
+
+      <div id="circleUI" style="display:none;">
+        <label>Calibration circle diameter (mm)</label>
+        <input id="circleMm" type="number" value="5" step="0.1" min="0.1" />
+        <p class="hint">A solid dark dot of known diameter on the white background.</p>
+      </div>
+
+      <div class="calib-status" id="calibStatus">Scale not set yet.</div>
+    </div>
+
+    <div class="card" id="optCard" style="display:none;">
+      <h2>3 · Bead options</h2>
+      <div class="row">
+        <div>
+          <label>Min Ø (mm)</label>
+          <input id="minMm" type="number" value="1.0" step="0.1" min="0.1" />
+        </div>
+        <div>
+          <label>Max Ø (mm)</label>
+          <input id="maxMm" type="number" value="8.0" step="0.1" min="0.1" />
+        </div>
+        <div>
+          <label>Min conf (%)</label>
+          <input id="minConf" type="number" value="90" step="1" min="0" max="99" />
+        </div>
+      </div>
+      <button id="measureBtn">📏 Measure beads</button>
+    </div>
+
+    <div class="card" id="canvasCard" style="display:none;">
+      <h2>Image</h2>
+      <canvas id="view"></canvas>
+      <div id="qualityNote" class="hint"></div>
+    </div>
+
+    <div id="results"></div>
+
+    <div class="card" id="exportCard" style="display:none;">
+      <h2>Export</h2>
+      <button class="secondary" id="dlImg">⬇️ Download annotated image</button>
+      <button class="secondary" id="dlCsv">⬇️ Download CSV report</button>
+    </div>
+
+  </div>
+</div>
+
+<script async src="https://docs.opencv.org/4.10.0/opencv.js" onload="onOpenCvReady()" onerror="onOpenCvError()"></script>
+<script src="app.js"></script>
+</body>
+</html>

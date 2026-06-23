@@ -1,0 +1,693 @@
+/* Glass Bead Measurement — browser engine.
+ *
+ * A client-side port of the Python pipeline: calibrate pixels-per-mm from a
+ * known reference, segment beads + holes, fit sub-pixel circles (Taubin +
+ * RANSAC), and report OD / ID / wall thickness / roundness / confidence.
+ * Everything runs locally in the browser — no image ever leaves the device.
+ */
+
+"use strict";
+
+const MAX_WORK_DIM = 2400; // Downscale cap for mobile performance.
+
+const state = {
+  ready: false,
+  baseCanvas: document.createElement("canvas"), // clean working-res image
+  hasImage: false,
+  calib: null,            // { pxPerMm, method, confidence }
+  taps: [],               // two-point calibration taps in working px
+  results: null,          // last measurement results for export
+};
+
+/* ---------- OpenCV lifecycle ------------------------------------------- */
+
+function onOpenCvError() {
+  document.getElementById("loading").innerHTML =
+    "⚠️ Could not load the vision engine. Check your internet connection and reload.";
+}
+
+function onOpenCvReady() {
+  // cv may be a promise-like in some builds.
+  if (window.cv && cv.then) {
+    cv.then(() => finishInit());
+  } else if (window.cv && cv.Mat) {
+    finishInit();
+  } else {
+    cv["onRuntimeInitialized"] = finishInit;
+  }
+}
+
+function finishInit() {
+  state.ready = true;
+  document.getElementById("loading").style.display = "none";
+  document.getElementById("app").style.display = "block";
+  wireUI();
+}
+
+/* ---------- UI wiring --------------------------------------------------- */
+
+function wireUI() {
+  document.getElementById("fileInput").addEventListener("change", onFile);
+  document.getElementById("calibMethod").addEventListener("change", onCalibMethod);
+  document.getElementById("resetTaps").addEventListener("click", (e) => {
+    e.preventDefault();
+    state.taps = [];
+    redraw();
+    updateCalibStatus("Taps reset. Tap two points again.");
+  });
+  ["knownDist", "pxPerMm", "circleMm"].forEach((id) =>
+    document.getElementById(id).addEventListener("input", recomputeCalib)
+  );
+  document.getElementById("measureBtn").addEventListener("click", runMeasurement);
+  document.getElementById("dlImg").addEventListener("click", downloadImage);
+  document.getElementById("dlCsv").addEventListener("click", downloadCsv);
+
+  const view = document.getElementById("view");
+  view.addEventListener("click", onCanvasTap);
+  view.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    const t = e.touches[0];
+    onCanvasTap({ clientX: t.clientX, clientY: t.clientY });
+  }, { passive: false });
+}
+
+function onCalibMethod() {
+  const m = document.getElementById("calibMethod").value;
+  document.getElementById("twopointUI").style.display = m === "twopoint" ? "block" : "none";
+  document.getElementById("manualUI").style.display = m === "manual" ? "block" : "none";
+  document.getElementById("circleUI").style.display = m === "circle" ? "block" : "none";
+  state.taps = [];
+  redraw();
+  recomputeCalib();
+}
+
+/* ---------- Image loading ---------------------------------------------- */
+
+function onFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => {
+    let { width: w, height: h } = img;
+    const scale = Math.min(1, MAX_WORK_DIM / Math.max(w, h));
+    w = Math.round(w * scale);
+    h = Math.round(h * scale);
+    const c = state.baseCanvas;
+    c.width = w;
+    c.height = h;
+    c.getContext("2d").drawImage(img, 0, 0, w, h);
+    state.hasImage = true;
+    state.taps = [];
+    state.results = null;
+    URL.revokeObjectURL(img.src);
+
+    ["calibCard", "optCard", "canvasCard"].forEach(
+      (id) => (document.getElementById(id).style.display = "block")
+    );
+    document.getElementById("results").innerHTML = "";
+    document.getElementById("exportCard").style.display = "none";
+    redraw();
+    onCalibMethod();
+  };
+  img.src = URL.createObjectURL(file);
+}
+
+/* ---------- Canvas drawing --------------------------------------------- */
+
+function redraw() {
+  const view = document.getElementById("view");
+  const base = state.baseCanvas;
+  if (!state.hasImage) return;
+  view.width = base.width;
+  view.height = base.height;
+  const ctx = view.getContext("2d");
+  ctx.drawImage(base, 0, 0);
+  drawTaps(ctx);
+}
+
+function drawTaps(ctx) {
+  state.taps.forEach((p, i) => {
+    ctx.strokeStyle = "#38bdf8";
+    ctx.fillStyle = "#38bdf8";
+    ctx.lineWidth = Math.max(2, state.baseCanvas.width / 600);
+    const r = Math.max(6, state.baseCanvas.width / 150);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = `${r * 2}px sans-serif`;
+    ctx.fillText(String(i + 1), p.x + r, p.y - r);
+  });
+  if (state.taps.length === 2) {
+    ctx.beginPath();
+    ctx.moveTo(state.taps[0].x, state.taps[0].y);
+    ctx.lineTo(state.taps[1].x, state.taps[1].y);
+    ctx.stroke();
+  }
+}
+
+function onCanvasTap(e) {
+  if (document.getElementById("calibMethod").value !== "twopoint") return;
+  if (!state.hasImage) return;
+  const view = document.getElementById("view");
+  const rect = view.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (view.width / rect.width);
+  const y = (e.clientY - rect.top) * (view.height / rect.height);
+  if (state.taps.length >= 2) state.taps = [];
+  state.taps.push({ x, y });
+  redraw();
+  recomputeCalib();
+}
+
+/* ---------- Calibration ------------------------------------------------ */
+
+function recomputeCalib() {
+  const method = document.getElementById("calibMethod").value;
+  state.calib = null;
+  if (method === "twopoint") {
+    if (state.taps.length < 2) {
+      updateCalibStatus("Tap two points on the image, then enter their distance.");
+      return;
+    }
+    const d = parseFloat(document.getElementById("knownDist").value);
+    const distPx = Math.hypot(
+      state.taps[0].x - state.taps[1].x,
+      state.taps[0].y - state.taps[1].y
+    );
+    if (!(d > 0) || distPx < 2) {
+      updateCalibStatus("Invalid distance.");
+      return;
+    }
+    state.calib = { pxPerMm: distPx / d, method: "twopoint", confidence: 0.85 };
+    updateCalibStatus(`✅ Scale: ${state.calib.pxPerMm.toFixed(2)} px/mm`);
+  } else if (method === "manual") {
+    const v = parseFloat(document.getElementById("pxPerMm").value);
+    if (!(v > 0)) {
+      updateCalibStatus("Enter a positive px/mm value.");
+      return;
+    }
+    state.calib = { pxPerMm: v, method: "manual", confidence: 0.85 };
+    updateCalibStatus(`✅ Scale: ${v.toFixed(2)} px/mm`);
+  } else {
+    updateCalibStatus("Calibration circle will be detected when you press Measure.");
+    state.calib = { pxPerMm: null, method: "circle", confidence: 0.9 };
+  }
+}
+
+function updateCalibStatus(msg) {
+  document.getElementById("calibStatus").textContent = msg;
+}
+
+/* ---------- Geometry: Taubin + RANSAC circle fit ----------------------- */
+
+function taubinFit(pts) {
+  const n = pts.length;
+  let xm = 0, ym = 0;
+  for (const p of pts) { xm += p[0]; ym += p[1]; }
+  xm /= n; ym /= n;
+  let Suu = 0, Svv = 0, Suv = 0, Suz = 0, Svz = 0, zmean = 0;
+  for (const p of pts) {
+    const u = p[0] - xm, v = p[1] - ym, z = u * u + v * v;
+    Suu += u * u; Svv += v * v; Suv += u * v;
+    Suz += u * z; Svz += v * z; zmean += z;
+  }
+  Suu /= n; Svv /= n; Suv /= n; Suz /= n; Svz /= n; zmean /= n;
+  const det = Suu * Svv - Suv * Suv;
+  const bx = 0.5 * Suz, by = 0.5 * Svz;
+  let uc, vc;
+  if (Math.abs(det) < 1e-12) { uc = 0; vc = 0; }
+  else { uc = (bx * Svv - by * Suv) / det; vc = (Suu * by - Suv * bx) / det; }
+  const cx = uc + xm, cy = vc + ym;
+  const radius = Math.sqrt(uc * uc + vc * vc + zmean);
+  return { cx, cy, radius };
+}
+
+function residualStats(pts, c) {
+  let sum = 0, rmax = -Infinity, rmin = Infinity;
+  for (const p of pts) {
+    const r = Math.hypot(p[0] - c.cx, p[1] - c.cy);
+    sum += (r - c.radius) * (r - c.radius);
+    if (r > rmax) rmax = r;
+    if (r < rmin) rmin = r;
+  }
+  return { rms: Math.sqrt(sum / pts.length), rmax, rmin };
+}
+
+function fitCircle(pts) {
+  const c = taubinFit(pts);
+  const s = residualStats(pts, c);
+  return { ...c, ...s, n: pts.length };
+}
+
+function fitCircleRansac(pts, { iterations = 120, threshold = 1.5 } = {}) {
+  const n = pts.length;
+  if (n < 10) return fitCircle(pts);
+  let bestInliers = null, bestCount = 0;
+  for (let it = 0; it < iterations; it++) {
+    const idx = [0, 0, 0].map(() => (Math.random() * n) | 0);
+    const sample = [pts[idx[0]], pts[idx[1]], pts[idx[2]]];
+    let c;
+    try { c = taubinFit(sample); } catch (_) { continue; }
+    if (!isFinite(c.radius) || c.radius <= 0) continue;
+    let inliers = [], count = 0;
+    for (const p of pts) {
+      const r = Math.hypot(p[0] - c.cx, p[1] - c.cy);
+      const ok = Math.abs(r - c.radius) < threshold;
+      inliers.push(ok);
+      if (ok) count++;
+    }
+    if (count > bestCount) { bestCount = count; bestInliers = inliers; }
+  }
+  if (!bestInliers || bestCount < 3) return fitCircle(pts);
+  const consensus = pts.filter((_, i) => bestInliers[i]);
+  const c = taubinFit(consensus);
+  const s = residualStats(consensus, c);
+  return { ...c, ...s, n: consensus.length };
+}
+
+function roundnessPct(c) {
+  if (c.radius <= 0) return 0;
+  const formError = (c.rmax - c.rmin) / c.radius;
+  return Math.max(0, Math.min(100, 100 * (1 - formError / 2)));
+}
+
+/* ---------- Sub-pixel edge refinement ---------------------------------- */
+
+function makeSampler(grayData, w, h) {
+  return function (x, y) {
+    if (x < 0 || y < 0 || x > w - 1 || y > h - 1) return NaN;
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const x1 = Math.min(x0 + 1, w - 1), y1 = Math.min(y0 + 1, h - 1);
+    const dx = x - x0, dy = y - y0;
+    const v00 = grayData[y0 * w + x0], v01 = grayData[y0 * w + x1];
+    const v10 = grayData[y1 * w + x0], v11 = grayData[y1 * w + x1];
+    const top = v00 * (1 - dx) + v01 * dx;
+    const bot = v10 * (1 - dx) + v11 * dx;
+    return top * (1 - dy) + bot * dy;
+  };
+}
+
+function refineEdges(sampler, pts, center, search = 4.0, step = 0.25) {
+  const out = [];
+  const offsets = [];
+  for (let o = -search; o <= search + 1e-9; o += step) offsets.push(o);
+  for (const p of pts) {
+    let dx = p[0] - center.cx, dy = p[1] - center.cy;
+    const norm = Math.hypot(dx, dy);
+    if (norm < 1e-6) { out.push(p); continue; }
+    dx /= norm; dy /= norm;
+    const samples = offsets.map((o) => sampler(p[0] + o * dx, p[1] + o * dy));
+    if (samples.some((v) => isNaN(v))) { out.push(p); continue; }
+    // gradient magnitude
+    const grad = samples.map((_, i) => {
+      if (i === 0) return Math.abs(samples[1] - samples[0]);
+      if (i === samples.length - 1) return Math.abs(samples[i] - samples[i - 1]);
+      return Math.abs((samples[i + 1] - samples[i - 1]) / 2);
+    });
+    let k = 0, gmax = -1;
+    for (let i = 0; i < grad.length; i++) if (grad[i] > gmax) { gmax = grad[i]; k = i; }
+    if (k <= 0 || k >= grad.length - 1) { out.push(p); continue; }
+    const g0 = grad[k - 1], g1 = grad[k], g2 = grad[k + 1];
+    const denom = g0 - 2 * g1 + g2;
+    let delta = Math.abs(denom) < 1e-9 ? 0 : 0.5 * (g0 - g2) / denom;
+    delta = Math.max(-1, Math.min(1, delta));
+    const best = offsets[k] + delta * step;
+    out.push([p[0] + best * dx, p[1] + best * dy]);
+  }
+  return out;
+}
+
+/* ---------- Helpers: contour extraction -------------------------------- */
+
+function contourToPoints(cnt) {
+  const data = cnt.data32S;
+  const pts = [];
+  for (let i = 0; i < data.length; i += 2) pts.push([data[i], data[i + 1]]);
+  return pts;
+}
+
+/* ---------- Quality gate ----------------------------------------------- */
+
+function edgeFocusScore(gray) {
+  const gx = new cv.Mat(), gy = new cv.Mat(), mag = new cv.Mat();
+  cv.Sobel(gray, gx, cv.CV_64F, 1, 0, 3);
+  cv.Sobel(gray, gy, cv.CV_64F, 0, 1, 3);
+  cv.magnitude(gx, gy, mag);
+  const lap = new cv.Mat();
+  cv.Laplacian(gray, lap, cv.CV_64F);
+  const md = mag.data64F, ld = lap.data64F;
+  // 99.5th percentile threshold via coarse sampling.
+  const sample = [];
+  for (let i = 0; i < md.length; i += Math.max(1, (md.length / 20000) | 0)) sample.push(md[i]);
+  sample.sort((a, b) => a - b);
+  const thr = Math.max(20, sample[Math.floor(sample.length * 0.995)] || 20);
+  let sum = 0, sum2 = 0, cnt = 0;
+  for (let i = 0; i < md.length; i++) {
+    if (md[i] >= thr) { sum += ld[i]; sum2 += ld[i] * ld[i]; cnt++; }
+  }
+  gx.delete(); gy.delete(); mag.delete(); lap.delete();
+  if (cnt < 50) return 1000; // not enough edges to judge — don't block
+  const mean = sum / cnt;
+  return sum2 / cnt - mean * mean;
+}
+
+function assessQuality(rgba, gray) {
+  const focus = edgeFocusScore(gray);
+  const gd = gray.data;
+  let sat = 0;
+  for (let i = 0; i < gd.length; i++) if (gd[i] >= 250) sat++;
+  const reflection = sat / gd.length;
+  const reasons = [];
+  if (focus < 150) reasons.push(`Image looks blurry (focus ${focus.toFixed(0)} < 150).`);
+  if (reflection > 0.05) reasons.push(`Too much glare (${(reflection * 100).toFixed(1)}% blown out).`);
+  return { focus, reflection, passed: reasons.length === 0, reasons };
+}
+
+/* ---------- Calibration circle detection ------------------------------- */
+
+function detectCalibrationCircle(gray, diameterMm) {
+  const blur = new cv.Mat(), bin = new cv.Mat();
+  cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+  cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+  const k = cv.Mat.ones(3, 3, cv.CV_8U);
+  cv.morphologyEx(bin, bin, cv.MORPH_OPEN, k);
+  const contours = new cv.MatVector(), hierarchy = new cv.Mat();
+  cv.findContours(bin, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
+  let best = null, bestCirc = 0, bestC = null;
+  for (let i = 0; i < contours.size(); i++) {
+    const c = contours.get(i);
+    const area = cv.contourArea(c);
+    const perim = cv.arcLength(c, true);
+    if (perim < 20 || area < 200) { c.delete(); continue; }
+    const circ = (4 * Math.PI * area) / (perim * perim);
+    if (circ > bestCirc) {
+      if (bestC) bestC.delete();
+      bestCirc = circ; best = contourToPoints(c); bestC = c;
+    } else c.delete();
+  }
+  blur.delete(); bin.delete(); k.delete(); contours.delete(); hierarchy.delete();
+  if (bestC) bestC.delete();
+  if (!best || bestCirc < 0.8) return null;
+  const fit = fitCircleRansac(best);
+  return { pxPerMm: (2 * fit.radius) / diameterMm, fit, confidence: Math.min(1, bestCirc) };
+}
+
+/* ---------- Main measurement pipeline ---------------------------------- */
+
+function runMeasurement() {
+  if (!state.hasImage) return;
+  recomputeCalib();
+  const btn = document.getElementById("measureBtn");
+  btn.disabled = true; btn.textContent = "Measuring…";
+  // Defer so the button repaint happens before heavy work.
+  setTimeout(() => {
+    try { measureNow(); }
+    catch (err) { showBanner("err", "Error: " + err.message); console.error(err); }
+    finally { btn.disabled = false; btn.textContent = "📏 Measure beads"; }
+  }, 30);
+}
+
+function measureNow() {
+  const resultsEl = document.getElementById("results");
+  resultsEl.innerHTML = "";
+  document.getElementById("exportCard").style.display = "none";
+
+  const src = cv.imread(state.baseCanvas); // RGBA
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  const quality = assessQuality(src, gray);
+  document.getElementById("qualityNote").textContent =
+    `Focus ${quality.focus.toFixed(0)} · Glare ${(quality.reflection * 100).toFixed(1)}%`;
+  if (!quality.passed) {
+    showBanner("err", "Measurement not reliable. Please retake photo. " + quality.reasons.join(" "));
+    src.delete(); gray.delete();
+    return;
+  }
+
+  // Resolve calibration.
+  let pxPerMm = null, calibConf = 0.85, calibMethod = state.calib ? state.calib.method : "?";
+  if (state.calib && state.calib.method === "circle") {
+    const mm = parseFloat(document.getElementById("circleMm").value);
+    const det = detectCalibrationCircle(gray, mm);
+    if (!det) {
+      showBanner("err", "No calibration circle found. Use a clear round reference, or another method.");
+      src.delete(); gray.delete();
+      return;
+    }
+    pxPerMm = det.pxPerMm; calibConf = det.confidence;
+  } else if (state.calib && state.calib.pxPerMm) {
+    pxPerMm = state.calib.pxPerMm; calibConf = state.calib.confidence;
+  }
+  if (!pxPerMm || !(pxPerMm > 0)) {
+    showBanner("err", "Calibration reference missing. Set the scale before measuring.");
+    src.delete(); gray.delete();
+    return;
+  }
+
+  // Detect beads.
+  const minMm = parseFloat(document.getElementById("minMm").value);
+  const maxMm = parseFloat(document.getElementById("maxMm").value);
+  const minConf = parseFloat(document.getElementById("minConf").value);
+  const minR = (minMm / 2) * pxPerMm, maxR = (maxMm / 2) * pxPerMm;
+  const minArea = Math.PI * minR * minR, maxArea = Math.PI * maxR * maxR;
+
+  const blur = new cv.Mat(), bin = new cv.Mat();
+  cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+  cv.threshold(blur, bin, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+  const k = cv.Mat.ones(5, 5, cv.CV_8U);
+  cv.morphologyEx(bin, bin, cv.MORPH_OPEN, k);
+  cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, k);
+
+  const contours = new cv.MatVector(), hierarchy = new cv.Mat();
+  cv.findContours(bin, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_NONE);
+
+  const grayData = gray.data; // Uint8Array
+  const sampler = makeSampler(grayData, gray.cols, gray.rows);
+
+  const beads = [];
+  for (let i = 0; i < contours.size(); i++) {
+    const parent = hierarchy.intPtr(0, i)[3];
+    if (parent !== -1) continue; // not an outer contour
+    const c = contours.get(i);
+    const area = cv.contourArea(c);
+    if (area < minArea || area > maxArea) { c.delete(); continue; }
+    const perim = cv.arcLength(c, true);
+    if (perim === 0) { c.delete(); continue; }
+    const circ = (4 * Math.PI * area) / (perim * perim);
+    if (circ < 0.6) { c.delete(); continue; }
+
+    const outerPts = contourToPoints(c);
+    // largest direct child = hole
+    let holePts = null, holeArea = 0;
+    let child = hierarchy.intPtr(0, i)[2];
+    while (child !== -1) {
+      const cc = contours.get(child);
+      const a = cv.contourArea(cc);
+      if (a >= 0.01 * area && a > holeArea) { holeArea = a; holePts = contourToPoints(cc); }
+      cc.delete();
+      child = hierarchy.intPtr(0, child)[0];
+    }
+    c.delete();
+    beads.push({ outerPts, holePts, area, cx0: 0, cy0: 0 });
+  }
+
+  // Order top-to-bottom, left-to-right for stable numbering.
+  beads.forEach((b) => {
+    let sx = 0, sy = 0;
+    for (const p of b.outerPts) { sx += p[0]; sy += p[1]; }
+    b.cx0 = sx / b.outerPts.length; b.cy0 = sy / b.outerPts.length;
+  });
+  beads.sort((a, b) => (Math.round(a.cy0 / 50) - Math.round(b.cy0 / 50)) || (a.cx0 - b.cx0));
+
+  const measured = [];
+  beads.forEach((b, idx) => {
+    const rough = fitCircleRansac(b.outerPts);
+    const refined = refineEdges(sampler, b.outerPts, rough, 4.0, 0.25);
+    const outer = fitCircleRansac(refined);
+    const od = outer.radius * 2 / pxPerMm;
+
+    let hole = null, id = null, wall = null;
+    if (b.holePts && b.holePts.length >= 5) {
+      const rh = fitCircleRansac(b.holePts);
+      const rhp = refineEdges(sampler, b.holePts, rh, 3.0, 0.25);
+      hole = fitCircleRansac(rhp);
+      id = hole.radius * 2 / pxPerMm;
+      wall = (od - id) / 2;
+    }
+
+    const contrast = localEdgeContrast(gray, outer);
+    const conf = scoreConfidence(outer, hole, calibConf, contrast);
+    measured.push({
+      index: idx + 1, od, id, wall,
+      roundness: roundnessPct(outer),
+      confidence: conf, reliable: conf >= minConf,
+      outer, hole,
+    });
+  });
+
+  // Draw annotations.
+  redraw();
+  drawAnnotations(measured, pxPerMm);
+
+  state.results = { beads: measured, pxPerMm, calibMethod };
+  renderResults(measured, { pxPerMm, calibMethod, calibConf });
+
+  src.delete(); gray.delete(); blur.delete(); bin.delete(); k.delete();
+  contours.delete(); hierarchy.delete();
+}
+
+function localEdgeContrast(gray, circle) {
+  const r = Math.round(circle.radius * 1.2);
+  const x0 = Math.max(0, Math.round(circle.cx - r));
+  const y0 = Math.max(0, Math.round(circle.cy - r));
+  const x1 = Math.min(gray.cols, Math.round(circle.cx + r));
+  const y1 = Math.min(gray.rows, Math.round(circle.cy + r));
+  if (x1 - x0 < 4 || y1 - y0 < 4) return 0;
+  const roi = gray.roi(new cv.Rect(x0, y0, x1 - x0, y1 - y0));
+  const gx = new cv.Mat(), gy = new cv.Mat(), mag = new cv.Mat();
+  cv.Sobel(roi, gx, cv.CV_64F, 1, 0, 3);
+  cv.Sobel(roi, gy, cv.CV_64F, 0, 1, 3);
+  cv.magnitude(gx, gy, mag);
+  const d = mag.data64F;
+  let mx = 0;
+  for (let i = 0; i < d.length; i += 3) if (d[i] > mx) mx = d[i];
+  roi.delete(); gx.delete(); gy.delete(); mag.delete();
+  return Math.max(0, Math.min(1, mx / (255 * 1.414)));
+}
+
+function scoreConfidence(outer, hole, calibConf, contrast) {
+  const rf = (c) => (c.radius <= 0 ? 0 : Math.max(0, Math.min(1, 1 - (c.rms / c.radius) * 100)));
+  const factors = [
+    rf(outer),                                 // outer fit
+    Math.max(0, Math.min(1, roundnessPct(outer) / 100)),
+    Math.max(0, Math.min(1, outer.radius * 2 / 300)), // resolution
+    Math.max(0, Math.min(1, contrast)),
+    Math.max(0, Math.min(1, calibConf)),
+    hole ? rf(hole) : 0.7,
+  ];
+  const weights = [0.25, 0.15, 0.15, 0.15, 0.2, 0.1];
+  let logsum = 0;
+  for (let i = 0; i < factors.length; i++) {
+    logsum += weights[i] * Math.log(Math.max(1e-3, factors[i]));
+  }
+  return Math.round(Math.exp(logsum) * 1000) / 10;
+}
+
+/* ---------- Rendering -------------------------------------------------- */
+
+function drawAnnotations(beads, pxPerMm) {
+  const ctx = document.getElementById("view").getContext("2d");
+  const base = state.baseCanvas.width;
+  const lw = Math.max(2, base / 500);
+  const fs = Math.max(14, base / 45);
+  ctx.lineWidth = lw;
+  ctx.font = `bold ${fs}px sans-serif`;
+  ctx.textBaseline = "top";
+
+  beads.forEach((m) => {
+    const color = m.reliable ? "#22c55e" : "#eab308";
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.arc(m.outer.cx, m.outer.cy, m.outer.radius, 0, Math.PI * 2);
+    ctx.stroke();
+    // center cross
+    ctx.beginPath();
+    ctx.moveTo(m.outer.cx - fs / 2, m.outer.cy); ctx.lineTo(m.outer.cx + fs / 2, m.outer.cy);
+    ctx.moveTo(m.outer.cx, m.outer.cy - fs / 2); ctx.lineTo(m.outer.cx, m.outer.cy + fs / 2);
+    ctx.stroke();
+    if (m.hole) {
+      ctx.strokeStyle = "#ef4444";
+      ctx.beginPath();
+      ctx.arc(m.hole.cx, m.hole.cy, m.hole.radius, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    const lines = [`#${m.index}`, `OD ${m.od.toFixed(2)}mm`];
+    if (m.id != null) lines.push(`ID ${m.id.toFixed(2)}mm`);
+    if (m.wall != null) lines.push(`W ${m.wall.toFixed(2)}mm`);
+    lines.push(`${m.confidence.toFixed(0)}%`);
+    const lx = m.outer.cx + m.outer.radius + 6;
+    const ly = m.outer.cy - m.outer.radius;
+    lines.forEach((t, i) => {
+      const y = ly + i * (fs + 3);
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(lx - 2, y, ctx.measureText(t).width + 6, fs + 2);
+      ctx.fillStyle = color;
+      ctx.fillText(t, lx + 1, y + 1);
+    });
+  });
+
+  // scale bar (1 mm)
+  const barPx = pxPerMm;
+  if (barPx > 4 && barPx < base * 0.8) {
+    const m = 20, y = state.baseCanvas.height - m;
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = lw * 1.5;
+    ctx.beginPath(); ctx.moveTo(m, y); ctx.lineTo(m + barPx, y); ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.fillText("1 mm", m, y - fs - 4);
+  }
+}
+
+function confClass(m) { return m.reliable ? "ok" : (m.confidence >= 70 ? "warnc" : "bad"); }
+
+function renderResults(beads, info) {
+  const el = document.getElementById("results");
+  if (beads.length === 0) {
+    el.innerHTML = `<div class="banner warn">Calibration OK (${info.pxPerMm.toFixed(1)} px/mm) but no beads were detected. Adjust the size range or retake the photo.</div>`;
+    return;
+  }
+  const reliable = beads.filter((b) => b.reliable).length;
+  let html = `<div class="banner ok">${beads.length} bead(s) measured · ${reliable} reliable · scale ${info.pxPerMm.toFixed(1)} px/mm (${info.calibMethod})</div>`;
+  html += `<div class="card"><h2>Results</h2>`;
+  beads.forEach((m) => {
+    const badge = m.reliable ? "✅" : "⚠️";
+    html += `<div class="bead"><h3>${badge} Bead #${m.index}</h3><div class="metrics">
+      <div class="metric"><div class="v">${m.od.toFixed(2)}</div><div class="k">OD mm</div></div>
+      <div class="metric"><div class="v">${m.id != null ? m.id.toFixed(2) : "–"}</div><div class="k">Hole mm</div></div>
+      <div class="metric"><div class="v">${m.wall != null ? m.wall.toFixed(2) : "–"}</div><div class="k">Wall mm</div></div>
+      <div class="metric"><div class="v">${m.roundness.toFixed(1)}</div><div class="k">Round %</div></div>
+      <div class="metric"><div class="v ${confClass(m)}">${m.confidence.toFixed(0)}</div><div class="k">Conf %</div></div>
+      <div class="metric"><div class="v">${m.reliable ? "OK" : "Low"}</div><div class="k">Status</div></div>
+    </div>`;
+    if (!m.reliable) html += `<p class="hint">Confidence below threshold — consider retaking the photo.</p>`;
+    html += `</div>`;
+  });
+  html += `</div>`;
+  el.innerHTML = html;
+  document.getElementById("exportCard").style.display = "block";
+}
+
+function showBanner(kind, msg) {
+  document.getElementById("results").innerHTML = `<div class="banner ${kind}">${msg}</div>`;
+}
+
+/* ---------- Export ----------------------------------------------------- */
+
+function downloadImage() {
+  const view = document.getElementById("view");
+  view.toBlob((blob) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "bead_measurement.png";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+}
+
+function downloadCsv() {
+  if (!state.results) return;
+  const rows = [["bead", "outer_diameter_mm", "hole_diameter_mm", "wall_thickness_mm", "roundness_pct", "confidence_pct", "reliable"]];
+  state.results.beads.forEach((m) => rows.push([
+    m.index, m.od.toFixed(3), m.id != null ? m.id.toFixed(3) : "",
+    m.wall != null ? m.wall.toFixed(3) : "", m.roundness.toFixed(1),
+    m.confidence.toFixed(1), m.reliable,
+  ]));
+  const csv = rows.map((r) => r.join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "bead_report.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
