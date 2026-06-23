@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Generated outputs (regenerate with `python cli.py --demo ...`)
+samples/*.png
+samples/*.xlsx
+samples/*.csv
+annotated.png
+*.xlsx
+!requirements.txt

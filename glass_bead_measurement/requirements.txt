@@ -1,0 +1,20 @@
+# Core computer-vision / numerics
+numpy>=1.24
+opencv-contrib-python>=4.7      # contrib build provides cv2.aruco
+scipy>=1.10
+scikit-image>=0.21
+
+# Reporting
+pandas>=2.0
+openpyxl>=3.1
+
+# UI
+streamlit>=1.30
+
+# Testing (optional, for `pytest`)
+pytest>=7.4
+
+# NOTE: opencv-contrib-python (not the plain opencv-python wheel) is required
+# for ArUco calibration. On a headless server use opencv-contrib-python-headless.
+# YOLOv8 (ultralytics) is an OPTIONAL upgrade for bead detection on cluttered
+# backgrounds; the default pipeline uses classical segmentation and needs no GPU.
