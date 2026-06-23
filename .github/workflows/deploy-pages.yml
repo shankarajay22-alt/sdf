@@ -1,0 +1,51 @@
+name: Deploy web app to GitHub Pages
+
+# Publishes the browser-based glass bead measurement tool (web/) to GitHub
+# Pages so it can be opened from any phone browser. After the first successful
+# run the site is served at https://<owner>.github.io/<repo>/
+
+on:
+  push:
+    branches:
+      - main
+      - claude/glass-bead-measurement-1vykid
+    paths:
+      - "web/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; newer pushes supersede in-progress runs.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        # enablement:true turns on Pages (with the GitHub Actions source) if it
+        # isn't already enabled, so no manual settings step is required.
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
